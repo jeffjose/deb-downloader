@@ -16,7 +16,7 @@ Non-interactive:
 
 Run directly via curl:
 ```bash
-curl -fsSL <SCRIPT_URL> | bash -s -- --url "https://example.com/debian" --package mypackage --dist stable
+curl -fsSL https://raw.githubusercontent.com/jeffjose/deb-downloader/main/deb-downloader.sh | bash -s -- --url "https://example.com/debian" --package mypackage --dist stable
 ```
 
 ## Requirements
