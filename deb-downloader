@@ -78,6 +78,37 @@ def get_architecture() -> str:
     return result.stdout.strip()
 
 
+def discover_distributions(url: str) -> list[str]:
+    """Try to discover available distributions from the repository."""
+    import re
+
+    dists_url = f"{url}/dists/"
+
+    try:
+        response = requests.get(dists_url, timeout=10)
+        response.raise_for_status()
+
+        # Parse HTML directory listing for distribution names
+        # Look for links that are directories (end with /)
+        content = response.text
+
+        # Match patterns like <a href="stable/">stable/</a> or similar
+        pattern = r'<a[^>]*href=["\']([^"\']+)/["\'][^>]*>([^<]+)/?</a>'
+        matches = re.findall(pattern, content)
+
+        distributions = []
+        for href, text in matches:
+            # Clean up the distribution name
+            dist = href.strip('/').split('/')[-1]
+            # Skip common non-distribution directories
+            if dist and dist not in ['.', '..', 'by-hash']:
+                distributions.append(dist)
+
+        return distributions
+    except:
+        return []
+
+
 def fetch_packages_list(url: str, distribution: str, component: str, arch: str) -> list[dict]:
     """Fetch and parse the Packages file from the repository."""
     packages_url = f"{url}/dists/{distribution}/{component}/binary-{arch}/Packages"
@@ -200,12 +231,33 @@ Examples:
                 # Just a URL, need distribution
                 url = args.url.rstrip('/')
                 if not args.dist:
-                    if non_interactive:
-                        print("Error: --dist is required when --url is just a URL")
-                        sys.exit(1)
-                    distribution = questionary.text("Enter distribution name:").ask()
-                    if not distribution:
-                        sys.exit(1)
+                    # Try to auto-discover distributions
+                    print("Discovering available distributions...")
+                    distributions = discover_distributions(url)
+
+                    if len(distributions) == 1:
+                        distribution = distributions[0]
+                        print(f"Found distribution: {distribution}")
+                    elif len(distributions) > 1:
+                        if non_interactive:
+                            print(f"Error: Multiple distributions found: {', '.join(distributions)}")
+                            print("Please specify one with --dist")
+                            sys.exit(1)
+                        # Interactive: let user choose
+                        distribution = questionary.select(
+                            "Select a distribution:",
+                            choices=distributions
+                        ).ask()
+                        if not distribution:
+                            sys.exit(1)
+                    else:
+                        # No distributions found
+                        if non_interactive:
+                            print("Error: Could not discover distributions. Please specify with --dist")
+                            sys.exit(1)
+                        distribution = questionary.text("Enter distribution name:").ask()
+                        if not distribution:
+                            sys.exit(1)
                 else:
                     distribution = args.dist
                 component = args.component
