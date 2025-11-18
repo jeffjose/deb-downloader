@@ -14,6 +14,11 @@ Non-interactive:
 ./deb-downloader --url "deb https://example.com/debian stable main" --package mypackage
 ```
 
+Run directly via curl:
+```bash
+curl -fsSL <SCRIPT_URL> | bash -s -- --url "https://example.com/debian" --package mypackage --dist stable
+```
+
 ## Requirements
 
 Uses uv for dependency management (auto-installs on first run).
