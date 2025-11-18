@@ -1,0 +1,318 @@
+#!/usr/bin/env -S uv run
+# /// script
+# dependencies = [
+#   "questionary",
+#   "requests",
+# ]
+# ///
+
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+import questionary
+import requests
+
+
+def clean_repo_line(line: str) -> str:
+    """Clean up various formats of APT repository lines."""
+    # Remove leading/trailing whitespace
+    line = line.strip()
+
+    # Remove 'echo' command
+    line = re.sub(r'^echo\s+', '', line)
+
+    # Remove 'sudo tee' or similar commands
+    line = re.sub(r'\|\s*sudo\s+tee.*$', '', line)
+
+    # Remove trailing pipes and backslashes (with any whitespace between/around them)
+    # Keep removing until no more trailing pipes/backslashes/whitespace
+    while True:
+        old_line = line
+        line = re.sub(r'[\s|\\]+$', '', line)
+        if line == old_line:
+            break
+
+    # Trim again
+    line = line.strip()
+
+    # Remove surrounding quotes AFTER cleaning trailing stuff
+    line = re.sub(r'^"(.*)"$', r'\1', line)
+    line = re.sub(r"^'(.*)'$", r'\1', line)
+
+    return line.strip()
+
+
+def parse_repo_line(line: str) -> tuple[str, str, str]:
+    """Parse APT repository line into URL, distribution, and component."""
+    cleaned = clean_repo_line(line)
+
+    # Check if it starts with deb or deb-src
+    if not cleaned.startswith(('deb ', 'deb-src ')):
+        raise ValueError(f"Invalid repository line: {cleaned}")
+
+    # Remove 'deb' or 'deb-src'
+    cleaned = re.sub(r'^(deb|deb-src)\s+', '', cleaned)
+
+    # Remove options in brackets [...]
+    cleaned = re.sub(r'\[[^\]]*\]\s*', '', cleaned)
+
+    # Split into parts
+    parts = cleaned.split()
+    if len(parts) < 2:
+        raise ValueError(f"Invalid repository format: {cleaned}")
+
+    url = parts[0].rstrip('/')
+    distribution = parts[1]
+    component = parts[2] if len(parts) > 2 else 'main'
+
+    return url, distribution, component
+
+
+def get_architecture() -> str:
+    """Get system architecture."""
+    result = subprocess.run(['dpkg', '--print-architecture'],
+                          capture_output=True, text=True, check=True)
+    return result.stdout.strip()
+
+
+def fetch_packages_list(url: str, distribution: str, component: str, arch: str) -> list[dict]:
+    """Fetch and parse the Packages file from the repository."""
+    packages_url = f"{url}/dists/{distribution}/{component}/binary-{arch}/Packages"
+
+    print(f"Fetching package list from {packages_url}...")
+
+    # Try compressed first, then uncompressed
+    try:
+        response = requests.get(f"{packages_url}.gz", timeout=30)
+        response.raise_for_status()
+        import gzip
+        content = gzip.decompress(response.content).decode('utf-8')
+    except:
+        response = requests.get(packages_url, timeout=30)
+        response.raise_for_status()
+        content = response.text
+
+    # Parse packages
+    packages = []
+    current_package = {}
+
+    for line in content.split('\n'):
+        if line.startswith('Package: '):
+            if current_package:
+                packages.append(current_package)
+            current_package = {'name': line.split('Package: ', 1)[1].strip()}
+        elif line.startswith('Version: '):
+            current_package['version'] = line.split('Version: ', 1)[1].strip()
+        elif line.startswith('Filename: '):
+            current_package['filename'] = line.split('Filename: ', 1)[1].strip()
+        elif line.startswith('Size: '):
+            current_package['size'] = int(line.split('Size: ', 1)[1].strip())
+        elif line.startswith('Description: '):
+            current_package['description'] = line.split('Description: ', 1)[1].strip()
+
+    if current_package:
+        packages.append(current_package)
+
+    return packages
+
+
+def format_size(size: int) -> str:
+    """Format size in bytes to human-readable format."""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
+
+def download_package(url: str, filename: str, output_path: str):
+    """Download package with progress bar."""
+    download_url = f"{url}/{filename}"
+
+    print(f"\nDownloading {Path(filename).name}...")
+
+    response = requests.get(download_url, stream=True, timeout=30)
+    response.raise_for_status()
+
+    total_size = int(response.headers.get('content-length', 0))
+
+    with open(output_path, 'wb') as f:
+        if total_size == 0:
+            f.write(response.content)
+        else:
+            downloaded = 0
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+                downloaded += len(chunk)
+                percent = (downloaded / total_size) * 100
+                bar_length = 50
+                filled = int(bar_length * downloaded / total_size)
+                bar = '=' * filled + '-' * (bar_length - filled)
+                print(f'\r[{bar}] {percent:.1f}% ({format_size(downloaded)}/{format_size(total_size)})',
+                      end='', flush=True)
+            print()  # New line after completion
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Download .deb packages from APT repositories',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  Interactive mode:
+    %(prog)s
+
+  Non-interactive mode:
+    %(prog)s --url "deb https://example.com/debian stable main" --package mypackage
+    %(prog)s --url https://example.com/debian --dist stable --component main --package mypackage
+        '''
+    )
+
+    parser.add_argument('--url', help='Repository URL or full deb line')
+    parser.add_argument('--dist', '--distribution', help='Distribution name (e.g., stable, focal)')
+    parser.add_argument('--component', default='main', help='Component (default: main)')
+    parser.add_argument('--package', help='Package name to download')
+    parser.add_argument('--arch', help='Architecture (default: auto-detect)')
+
+    args = parser.parse_args()
+
+    print("=== Debian Package Downloader ===\n")
+
+    # Determine if we're in non-interactive mode
+    non_interactive = args.url and args.package
+
+    # Get repository info
+    if args.url:
+        # Check if it's a full deb line or just a URL
+        if args.url.startswith(('deb ', 'deb-src ', 'http://', 'https://')):
+            if args.url.startswith(('deb ', 'deb-src ')):
+                # Parse as full deb line
+                try:
+                    url, distribution, component = parse_repo_line(args.url)
+                except ValueError as e:
+                    print(f"Error: {e}")
+                    sys.exit(1)
+            else:
+                # Just a URL, need distribution
+                url = args.url.rstrip('/')
+                if not args.dist:
+                    if non_interactive:
+                        print("Error: --dist is required when --url is just a URL")
+                        sys.exit(1)
+                    distribution = questionary.text("Enter distribution name:").ask()
+                    if not distribution:
+                        sys.exit(1)
+                else:
+                    distribution = args.dist
+                component = args.component
+        else:
+            print(f"Error: Invalid URL format: {args.url}")
+            sys.exit(1)
+    else:
+        # Interactive mode: ask for repository line
+        repo_line = questionary.text(
+            "Paste your APT repository line:",
+            instruction="(e.g., deb [signed-by=...] https://example.com/debian stable main)"
+        ).ask()
+
+        if not repo_line:
+            print("No repository line provided.")
+            sys.exit(1)
+
+        try:
+            url, distribution, component = parse_repo_line(repo_line)
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+    print(f"\nParsed repository info:")
+    print(f"  URL: {url}")
+    print(f"  Distribution: {distribution}")
+    print(f"  Component: {component}")
+
+    # Get architecture
+    arch = args.arch if args.arch else get_architecture()
+    print(f"  Architecture: {arch}\n")
+
+    # Fetch packages
+    try:
+        packages = fetch_packages_list(url, distribution, component, arch)
+    except Exception as e:
+        print(f"Error fetching packages: {e}")
+        sys.exit(1)
+
+    if not packages:
+        print("No packages found in repository.")
+        sys.exit(1)
+
+    print(f"Found {len(packages)} package(s)\n")
+
+    # Select package
+    if args.package:
+        # Non-interactive: find the specified package
+        selected = None
+        for pkg in packages:
+            if pkg.get('name') == args.package:
+                selected = pkg
+                break
+
+        if not selected:
+            print(f"Error: Package '{args.package}' not found in repository.")
+            print(f"\nAvailable packages:")
+            for pkg in packages:
+                print(f"  - {pkg.get('name')}")
+            sys.exit(1)
+
+        print(f"Selected: {selected.get('name')} {selected.get('version')}")
+    else:
+        # Interactive: show menu
+        choices = []
+        for pkg in packages:
+            name = pkg.get('name', 'unknown')
+            version = pkg.get('version', 'unknown')
+            size = format_size(pkg.get('size', 0))
+            description = pkg.get('description', 'No description')
+
+            # Truncate description if too long
+            if len(description) > 60:
+                description = description[:57] + '...'
+
+            label = f"{name:20s} {version:15s} {size:10s} | {description}"
+            choices.append(questionary.Choice(title=label, value=pkg))
+
+        selected = questionary.select(
+            "Select a package to download:",
+            choices=choices,
+            use_shortcuts=True,
+            use_arrow_keys=True,
+        ).ask()
+
+        if not selected:
+            print("No package selected.")
+            sys.exit(1)
+
+    # Download the selected package
+    filename = selected.get('filename')
+    if not filename:
+        print("Error: No filename found for package")
+        sys.exit(1)
+
+    output_filename = Path(filename).name
+
+    try:
+        download_package(url, filename, output_filename)
+        print(f"\n✓ Downloaded: {output_filename}")
+        print(f"\nTo install, run:")
+        print(f"  sudo dpkg -i {output_filename}")
+        print(f"\nIf there are dependency issues, run:")
+        print(f"  sudo apt-get install -f")
+    except Exception as e:
+        print(f"\nError downloading package: {e}")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
