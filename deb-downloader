@@ -176,6 +176,7 @@ Examples:
     parser.add_argument('--component', default='main', help='Component (default: main)')
     parser.add_argument('--package', help='Package name to download')
     parser.add_argument('--arch', help='Architecture (default: auto-detect)')
+    parser.add_argument('--output-dir', '-o', default='/tmp', help='Output directory (default: /tmp)')
 
     args = parser.parse_args()
 
@@ -300,13 +301,18 @@ Examples:
         print("Error: No filename found for package")
         sys.exit(1)
 
-    output_filename = Path(filename).name
+    # Create output directory if it doesn't exist
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build full output path
+    output_path = output_dir / Path(filename).name
 
     try:
-        download_package(url, filename, output_filename)
-        print(f"\n✓ Downloaded: {output_filename}")
+        download_package(url, filename, str(output_path))
+        print(f"\n✓ Downloaded: {output_path}")
         print(f"\nTo install, run:")
-        print(f"  sudo dpkg -i {output_filename}")
+        print(f"  sudo dpkg -i {output_path}")
         print(f"\nIf there are dependency issues, run:")
         print(f"  sudo apt-get install -f")
     except Exception as e:
