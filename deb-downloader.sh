@@ -33,6 +33,14 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_DIR="$2"
             shift 2
             ;;
+        --install)
+            INSTALL=true
+            shift
+            ;;
+        --overwrite)
+            OVERWRITE=true
+            shift
+            ;;
         -h|--help)
             echo "Usage: $0 --url URL --package NAME [OPTIONS]"
             echo ""
@@ -48,6 +56,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --arch ARCH            Architecture (default: auto-detect)"
             echo "  --output-dir DIR       Output directory (default: /tmp)"
             echo "  -o DIR                 Short form of --output-dir"
+            echo "  --install              Install the package after downloading"
+            echo "  --overwrite            Overwrite existing file if it exists"
             echo ""
             echo "Examples:"
             echo "  $0 --url \"deb https://example.com/debian stable main\" --package mypackage"
@@ -211,18 +221,58 @@ mkdir -p "$OUTPUT_DIR"
 
 OUTPUT_PATH="${OUTPUT_DIR}/${DEB_FILENAME}"
 
-echo "Downloading ${DEB_FILENAME}..."
-DEB_URL="${REPO_URL}/${DEB_PATH}"
-curl -fL --progress-bar "$DEB_URL" -o "$OUTPUT_PATH"
+if [ -f "$OUTPUT_PATH" ] && [ "$OVERWRITE" != "true" ]; then
+    echo "File already exists: $OUTPUT_PATH"
+    echo "Skipping download (use --overwrite to force download)"
+else
+    echo "Downloading ${DEB_FILENAME}..."
+    DEB_URL="${REPO_URL}/${DEB_PATH}"
+    PARTIAL_PATH="${OUTPUT_PATH}.part"
+
+    # Set up trap to clean up partial file on interrupt
+    trap 'rm -f "$PARTIAL_PATH"; echo -e "\nDownload cancelled."; exit 130' INT TERM
+
+    if curl -fL --progress-bar "$DEB_URL" -o "$PARTIAL_PATH"; then
+        mv "$PARTIAL_PATH" "$OUTPUT_PATH"
+        # Remove trap
+        trap - INT TERM
+        echo ""
+        echo "✓ Downloaded: $OUTPUT_PATH"
+    else
+        # Curl failed, clean up
+        rm -f "$PARTIAL_PATH"
+        echo ""
+        echo "Error: Download failed"
+        exit 1
+    fi
+fi
 
 # Clean up temp files
 rm -f /tmp/Packages /tmp/Packages.gz
 
-echo ""
-echo "✓ Downloaded: $OUTPUT_PATH"
-echo ""
-echo "To install, run:"
-echo "  sudo dpkg -i $OUTPUT_PATH"
-echo ""
-echo "If there are dependency issues, run:"
-echo "  sudo apt-get install -f"
+if [ "$INSTALL" = "true" ]; then
+    echo ""
+    echo "Installing $OUTPUT_PATH..."
+    if sudo dpkg -i "$OUTPUT_PATH"; then
+        echo ""
+        echo "✓ Installation successful"
+    else
+        echo ""
+        echo "Error during installation. Attempting to fix dependencies..."
+        if sudo apt-get install -f -y; then
+            echo ""
+            echo "✓ Dependencies fixed"
+        else
+            echo ""
+            echo "Failed to fix dependencies. Please check manually."
+            exit 1
+        fi
+    fi
+else
+    echo ""
+    echo "To install, run:"
+    echo "  sudo dpkg -i $OUTPUT_PATH"
+    echo ""
+    echo "If there are dependency issues, run:"
+    echo "  sudo apt-get install -f"
+fi

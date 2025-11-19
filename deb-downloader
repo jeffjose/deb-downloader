@@ -162,29 +162,44 @@ def format_size(size: int) -> str:
 def download_package(url: str, filename: str, output_path: str):
     """Download package with progress bar."""
     download_url = f"{url}/{filename}"
+    temp_path = f"{output_path}.part"
 
     print(f"\nDownloading {Path(filename).name}...")
 
-    response = requests.get(download_url, stream=True, timeout=30)
-    response.raise_for_status()
+    try:
+        response = requests.get(download_url, stream=True, timeout=30)
+        response.raise_for_status()
 
-    total_size = int(response.headers.get('content-length', 0))
+        total_size = int(response.headers.get('content-length', 0))
 
-    with open(output_path, 'wb') as f:
-        if total_size == 0:
-            f.write(response.content)
-        else:
-            downloaded = 0
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-                downloaded += len(chunk)
-                percent = (downloaded / total_size) * 100
-                bar_length = 50
-                filled = int(bar_length * downloaded / total_size)
-                bar = '=' * filled + '-' * (bar_length - filled)
-                print(f'\r[{bar}] {percent:.1f}% ({format_size(downloaded)}/{format_size(total_size)})',
-                      end='', flush=True)
-            print()  # New line after completion
+        with open(temp_path, 'wb') as f:
+            if total_size == 0:
+                f.write(response.content)
+            else:
+                downloaded = 0
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    percent = (downloaded / total_size) * 100
+                    bar_length = 50
+                    filled = int(bar_length * downloaded / total_size)
+                    bar = '=' * filled + '-' * (bar_length - filled)
+                    print(f'\r[{bar}] {percent:.1f}% ({format_size(downloaded)}/{format_size(total_size)})',
+                          end='', flush=True)
+                print()  # New line after completion
+
+        # Rename partial file to final filename
+        Path(temp_path).rename(output_path)
+
+    except (KeyboardInterrupt, Exception) as e:
+        # Clean up partial file
+        if Path(temp_path).exists():
+            Path(temp_path).unlink()
+        
+        if isinstance(e, KeyboardInterrupt):
+            print("\n\nDownload cancelled.")
+            sys.exit(130)
+        raise e
 
 
 def main():
@@ -208,6 +223,8 @@ Examples:
     parser.add_argument('--package', help='Package name to download')
     parser.add_argument('--arch', help='Architecture (default: auto-detect)')
     parser.add_argument('--output-dir', '-o', default='/tmp', help='Output directory (default: /tmp)')
+    parser.add_argument('--install', action='store_true', help='Install the package after downloading')
+    parser.add_argument('--overwrite', action='store_true', help='Overwrite existing file if it exists')
 
     args = parser.parse_args()
 
@@ -361,14 +378,34 @@ Examples:
     output_path = output_dir / Path(filename).name
 
     try:
-        download_package(url, filename, str(output_path))
-        print(f"\n✓ Downloaded: {output_path}")
-        print(f"\nTo install, run:")
-        print(f"  sudo dpkg -i {output_path}")
-        print(f"\nIf there are dependency issues, run:")
-        print(f"  sudo apt-get install -f")
+        if output_path.exists() and not args.overwrite:
+            print(f"\nFile already exists: {output_path}")
+            print("Skipping download (use --overwrite to force download)")
+        else:
+            download_package(url, filename, str(output_path))
+            print(f"\n✓ Downloaded: {output_path}")
+
+        if args.install:
+            print(f"\nInstalling {output_path}...")
+            try:
+                subprocess.run(['sudo', 'dpkg', '-i', str(output_path)], check=True)
+                print("\n✓ Installation successful")
+            except subprocess.CalledProcessError:
+                print("\nError during installation. Attempting to fix dependencies...")
+                try:
+                    subprocess.run(['sudo', 'apt-get', 'install', '-f', '-y'], check=True)
+                    print("\n✓ Dependencies fixed")
+                except subprocess.CalledProcessError:
+                    print("\nFailed to fix dependencies. Please check manually.")
+                    sys.exit(1)
+        else:
+            print(f"\nTo install, run:")
+            print(f"  sudo dpkg -i {output_path}")
+            print(f"\nIf there are dependency issues, run:")
+            print(f"  sudo apt-get install -f")
+
     except Exception as e:
-        print(f"\nError downloading package: {e}")
+        print(f"\nError processing package: {e}")
         sys.exit(1)
 
 
