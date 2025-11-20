@@ -2,6 +2,14 @@
 
 set -e
 
+# Colors
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+BLUE='\033[34m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
 # Default values
 COMPONENT="main"
 OUTPUT_DIR="/tmp"
@@ -25,6 +33,10 @@ while [[ $# -gt 0 ]]; do
             PACKAGE_NAME="$2"
             shift 2
             ;;
+        --version)
+            PACKAGE_VERSION="$2"
+            shift 2
+            ;;
         --arch)
             ARCH="$2"
             shift 2
@@ -37,26 +49,32 @@ while [[ $# -gt 0 ]]; do
             INSTALL=true
             shift
             ;;
+        --force)
+            FORCE=true
+            shift
+            ;;
         --overwrite)
             OVERWRITE=true
             shift
             ;;
         -h|--help)
-            echo "Usage: $0 --url URL --package NAME [OPTIONS]"
+            echo "Usage: $0 --url URL [OPTIONS]"
             echo ""
             echo "Download .deb packages from APT repositories"
             echo ""
             echo "Required:"
             echo "  --url URL              Repository URL or full deb line"
-            echo "  --package NAME         Package name to download"
             echo ""
             echo "Optional:"
+            echo "  --package NAME         Package name (auto-detected if only one available)"
             echo "  --dist DIST            Distribution name (required if --url is just a URL)"
             echo "  --component COMP       Component (default: main)"
+            echo "  --version VERSION      Specific version (default: latest)"
             echo "  --arch ARCH            Architecture (default: auto-detect)"
             echo "  --output-dir DIR       Output directory (default: /tmp)"
             echo "  -o DIR                 Short form of --output-dir"
             echo "  --install              Install the package after downloading"
+            echo "  --force                Force reinstall even if same version is installed"
             echo "  --overwrite            Overwrite existing file if it exists"
             echo ""
             echo "Examples:"
@@ -75,11 +93,6 @@ done
 # Validate required arguments
 if [ -z "$URL_INPUT" ]; then
     echo "Error: --url is required"
-    exit 1
-fi
-
-if [ -z "$PACKAGE_NAME" ]; then
-    echo "Error: --package is required"
     exit 1
 fi
 
@@ -175,46 +188,103 @@ if [ -z "$ARCH" ]; then
     ARCH=$(dpkg --print-architecture)
 fi
 
-echo "=== Debian Package Downloader ==="
-echo ""
-echo "Repository: $REPO_URL"
-echo "Distribution: $DISTRIBUTION"
-echo "Component: $COMPONENT"
-echo "Package: $PACKAGE_NAME"
-echo "Architecture: $ARCH"
-echo "Output: $OUTPUT_DIR"
-echo ""
+echo -e "${BLUE}${REPO_URL}/${DISTRIBUTION}/${COMPONENT}/${ARCH}${RESET}"
 
 # Download package index
 PACKAGES_URL="${REPO_URL}/dists/${DISTRIBUTION}/${COMPONENT}/binary-${ARCH}/Packages"
-
-echo "Downloading package index..."
 
 # Try compressed first, then uncompressed
 if curl -fsSL "${PACKAGES_URL}.gz" -o /tmp/Packages.gz 2>/dev/null; then
     gunzip -f /tmp/Packages.gz -c > /tmp/Packages
 elif curl -fsSL "${PACKAGES_URL}" -o /tmp/Packages 2>/dev/null; then
-    echo "Downloaded uncompressed Packages file"
+    : # Downloaded uncompressed
 else
-    echo "Error: Could not download Packages index from $PACKAGES_URL"
+    echo -e "${RED}Error: Could not download Packages index${RESET}"
     exit 1
 fi
 
-echo "Finding ${PACKAGE_NAME} package..."
+# Check if package name was provided, if not check if there's only one unique package
+if [ -z "$PACKAGE_NAME" ]; then
+    UNIQUE_PACKAGES=$(grep "^Package:" /tmp/Packages | awk '{print $2}' | sort -u)
+    NUM_UNIQUE=$(echo "$UNIQUE_PACKAGES" | wc -l)
 
-# Extract the filename from the Packages file
-DEB_PATH=$(grep -A 20 "^Package: ${PACKAGE_NAME}" /tmp/Packages | grep "^Filename:" | head -1 | awk '{print $2}')
+    if [ "$NUM_UNIQUE" -eq 1 ]; then
+        PACKAGE_NAME=$(echo "$UNIQUE_PACKAGES" | head -1)
+    else
+        echo -e "${RED}Error: Multiple packages found. Specify with --package${RESET}"
+        echo ""
+        echo "Available packages:"
+        echo "$UNIQUE_PACKAGES" | sed 's/^/  - /'
+        exit 1
+    fi
+fi
 
-if [ -z "$DEB_PATH" ]; then
+# Extract all versions of the package
+# Parse the Packages file to find all matching packages with their versions and filenames
+TMP_PKGS="/tmp/matching_packages.$$"
+rm -f "$TMP_PKGS"
+
+awk -v pkg="$PACKAGE_NAME" '
+/^Package:/ { current_pkg = $2 }
+/^Version:/ { if (current_pkg == pkg) current_version = $2 }
+/^Filename:/ {
+    if (current_pkg == pkg && current_version != "") {
+        print current_version "|" $2
+        current_version = ""
+    }
+}
+' /tmp/Packages > "$TMP_PKGS"
+
+if [ ! -s "$TMP_PKGS" ]; then
     echo "Error: Package '${PACKAGE_NAME}' not found in repository"
     echo ""
     echo "Available packages:"
     grep "^Package:" /tmp/Packages | sed 's/Package: /  - /'
+    rm -f "$TMP_PKGS"
     exit 1
 fi
 
+# Select version
+if [ -n "$PACKAGE_VERSION" ] && [ "$PACKAGE_VERSION" != "latest" ]; then
+    # Find specific version
+    DEB_PATH=$(grep "^${PACKAGE_VERSION}|" "$TMP_PKGS" | cut -d'|' -f2)
+
+    if [ -z "$DEB_PATH" ]; then
+        echo "Error: Package '${PACKAGE_NAME}' version '${PACKAGE_VERSION}' not found"
+        echo ""
+        echo "Available versions:"
+        cut -d'|' -f1 "$TMP_PKGS" | sed 's/^/  - /'
+        rm -f "$TMP_PKGS"
+        exit 1
+    fi
+
+    DEB_VERSION="$PACKAGE_VERSION"
+else
+    # Auto-select latest version using dpkg --compare-versions
+    LATEST_VERSION=""
+    LATEST_PATH=""
+
+    while IFS='|' read -r ver path; do
+        if [ -z "$LATEST_VERSION" ]; then
+            LATEST_VERSION="$ver"
+            LATEST_PATH="$path"
+        else
+            # Use dpkg to compare versions properly
+            if dpkg --compare-versions "$ver" gt "$LATEST_VERSION"; then
+                LATEST_VERSION="$ver"
+                LATEST_PATH="$path"
+            fi
+        fi
+    done < "$TMP_PKGS"
+
+    DEB_VERSION="$LATEST_VERSION"
+    DEB_PATH="$LATEST_PATH"
+fi
+
+rm -f "$TMP_PKGS"
+
 DEB_FILENAME=$(basename "$DEB_PATH")
-echo "Found: $DEB_FILENAME"
+echo -e "${GREEN}→${RESET} ${PACKAGE_NAME} ${BOLD}${DEB_VERSION}${RESET}"
 
 # Create output directory if it doesn't exist
 mkdir -p "$OUTPUT_DIR"
@@ -222,10 +292,8 @@ mkdir -p "$OUTPUT_DIR"
 OUTPUT_PATH="${OUTPUT_DIR}/${DEB_FILENAME}"
 
 if [ -f "$OUTPUT_PATH" ] && [ "$OVERWRITE" != "true" ]; then
-    echo "File already exists: $OUTPUT_PATH"
-    echo "Skipping download (use --overwrite to force download)"
+    echo -e "${YELLOW}✓${RESET} Cached: ${DEB_FILENAME}"
 else
-    echo "Downloading ${DEB_FILENAME}..."
     DEB_URL="${REPO_URL}/${DEB_PATH}"
     PARTIAL_PATH="${OUTPUT_PATH}.part"
 
@@ -237,12 +305,12 @@ else
         # Remove trap
         trap - INT TERM
         echo ""
-        echo "✓ Downloaded: $OUTPUT_PATH"
+        echo -e "${GREEN}✓${RESET} Downloaded: ${DEB_FILENAME}"
     else
         # Curl failed, clean up
         rm -f "$PARTIAL_PATH"
         echo ""
-        echo "Error: Download failed"
+        echo -e "${RED}✗${RESET} Download failed"
         exit 1
     fi
 fi
@@ -251,28 +319,28 @@ fi
 rm -f /tmp/Packages /tmp/Packages.gz
 
 if [ "$INSTALL" = "true" ]; then
-    echo ""
-    echo "Installing $OUTPUT_PATH..."
-    if sudo dpkg -i "$OUTPUT_PATH"; then
-        echo ""
-        echo "✓ Installation successful"
+    # Check if same version is already installed
+    INSTALLED_VERSION=""
+    if dpkg -s "$PACKAGE_NAME" &>/dev/null; then
+        INSTALLED_VERSION=$(dpkg -s "$PACKAGE_NAME" 2>/dev/null | grep "^Version:" | awk '{print $2}')
+    fi
+
+    if [ "$INSTALLED_VERSION" = "$DEB_VERSION" ] && [ "$FORCE" != "true" ]; then
+        echo -e "${GREEN}✓${RESET} Already installed"
     else
-        echo ""
-        echo "Error during installation. Attempting to fix dependencies..."
-        if sudo apt-get install -f -y; then
-            echo ""
-            echo "✓ Dependencies fixed"
+        if [ -n "$INSTALLED_VERSION" ]; then
+            echo -e "${YELLOW}↑${RESET} Upgrading from ${INSTALLED_VERSION}"
+        fi
+
+        if sudo dpkg -i "$OUTPUT_PATH" >/dev/null 2>&1; then
+            echo -e "${GREEN}✓${RESET} Installed"
         else
-            echo ""
-            echo "Failed to fix dependencies. Please check manually."
-            exit 1
+            if sudo apt-get install -f -y >/dev/null 2>&1; then
+                echo -e "${GREEN}✓${RESET} Installed (dependencies fixed)"
+            else
+                echo -e "${RED}✗${RESET} Installation failed"
+                exit 1
+            fi
         fi
     fi
-else
-    echo ""
-    echo "To install, run:"
-    echo "  sudo dpkg -i $OUTPUT_PATH"
-    echo ""
-    echo "If there are dependency issues, run:"
-    echo "  sudo apt-get install -f"
 fi

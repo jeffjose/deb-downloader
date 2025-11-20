@@ -15,6 +15,15 @@ from pathlib import Path
 import questionary
 import requests
 
+# ANSI color codes
+class Colors:
+    GREEN = '\033[32m'
+    YELLOW = '\033[33m'
+    RED = '\033[31m'
+    BLUE = '\033[34m'
+    BOLD = '\033[1m'
+    RESET = '\033[0m'
+
 
 def clean_repo_line(line: str) -> str:
     """Clean up various formats of APT repository lines."""
@@ -78,6 +87,24 @@ def get_architecture() -> str:
     return result.stdout.strip()
 
 
+def get_installed_version(package_name: str) -> str | None:
+    """Get the installed version of a package, or None if not installed."""
+    try:
+        result = subprocess.run(
+            ['dpkg', '-s', package_name],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if line.startswith('Version: '):
+                    return line.split('Version: ', 1)[1].strip()
+        return None
+    except:
+        return None
+
+
 def discover_distributions(url: str) -> list[str]:
     """Try to discover available distributions from the repository."""
     import re
@@ -112,8 +139,6 @@ def discover_distributions(url: str) -> list[str]:
 def fetch_packages_list(url: str, distribution: str, component: str, arch: str) -> list[dict]:
     """Fetch and parse the Packages file from the repository."""
     packages_url = f"{url}/dists/{distribution}/{component}/binary-{arch}/Packages"
-
-    print(f"Fetching package list from {packages_url}...")
 
     # Try compressed first, then uncompressed
     try:
@@ -164,8 +189,6 @@ def download_package(url: str, filename: str, output_path: str):
     download_url = f"{url}/{filename}"
     temp_path = f"{output_path}.part"
 
-    print(f"\nDownloading {Path(filename).name}...")
-
     try:
         response = requests.get(download_url, stream=True, timeout=30)
         response.raise_for_status()
@@ -208,27 +231,30 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  Interactive mode:
-    %(prog)s
+  Interactive mode (or auto-select if only one package):
+    %(prog)s --url "deb https://example.com/debian stable main"
 
-  Non-interactive mode:
+  Specify package and version:
     %(prog)s --url "deb https://example.com/debian stable main" --package mypackage
-    %(prog)s --url https://example.com/debian --dist stable --component main --package mypackage
+    %(prog)s --url https://example.com/debian --dist stable --package mypackage --version 1.2.3
+
+  Auto-install latest version:
+    %(prog)s --url https://example.com/debian --dist stable --install
         '''
     )
 
     parser.add_argument('--url', help='Repository URL or full deb line')
     parser.add_argument('--dist', '--distribution', help='Distribution name (e.g., stable, focal)')
     parser.add_argument('--component', default='main', help='Component (default: main)')
-    parser.add_argument('--package', help='Package name to download')
+    parser.add_argument('--package', help='Package name to download (auto-detected if only one available)')
+    parser.add_argument('--version', help='Specific package version to download (default: latest)')
     parser.add_argument('--arch', help='Architecture (default: auto-detect)')
     parser.add_argument('--output-dir', '-o', default='/tmp', help='Output directory (default: /tmp)')
     parser.add_argument('--install', action='store_true', help='Install the package after downloading')
+    parser.add_argument('--force', action='store_true', help='Force reinstall even if same version is already installed')
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing file if it exists')
 
     args = parser.parse_args()
-
-    print("=== Debian Package Downloader ===\n")
 
     # Determine if we're in non-interactive mode
     non_interactive = args.url and args.package
@@ -249,12 +275,10 @@ Examples:
                 url = args.url.rstrip('/')
                 if not args.dist:
                     # Try to auto-discover distributions
-                    print("Discovering available distributions...")
                     distributions = discover_distributions(url)
 
                     if len(distributions) == 1:
                         distribution = distributions[0]
-                        print(f"Found distribution: {distribution}")
                     elif len(distributions) > 1:
                         if non_interactive:
                             print(f"Error: Multiple distributions found: {', '.join(distributions)}")
@@ -298,14 +322,9 @@ Examples:
             print(f"Error: {e}")
             sys.exit(1)
 
-    print(f"\nParsed repository info:")
-    print(f"  URL: {url}")
-    print(f"  Distribution: {distribution}")
-    print(f"  Component: {component}")
-
     # Get architecture
     arch = args.arch if args.arch else get_architecture()
-    print(f"  Architecture: {arch}\n")
+    print(f"{Colors.BLUE}{url}/{distribution}/{component}/{arch}{Colors.RESET}")
 
     # Fetch packages
     try:
@@ -315,28 +334,65 @@ Examples:
         sys.exit(1)
 
     if not packages:
-        print("No packages found in repository.")
+        print(f"{Colors.RED}No packages found{Colors.RESET}")
         sys.exit(1)
 
-    print(f"Found {len(packages)} package(s)\n")
+    # Check if there's only one unique package name
+    unique_packages = set(pkg.get('name') for pkg in packages)
+    if len(unique_packages) == 1 and not args.package:
+        # Auto-select the package name if there's only one
+        args.package = list(unique_packages)[0]
 
     # Select package
     if args.package:
         # Non-interactive: find the specified package
-        selected = None
-        for pkg in packages:
-            if pkg.get('name') == args.package:
-                selected = pkg
-                break
+        matching_packages = [pkg for pkg in packages if pkg.get('name') == args.package]
 
-        if not selected:
+        if not matching_packages:
             print(f"Error: Package '{args.package}' not found in repository.")
             print(f"\nAvailable packages:")
             for pkg in packages:
                 print(f"  - {pkg.get('name')}")
             sys.exit(1)
 
-        print(f"Selected: {selected.get('name')} {selected.get('version')}")
+        if args.version and args.version != 'latest':
+            # Find specific version
+            selected = None
+            for pkg in matching_packages:
+                if pkg.get('version') == args.version:
+                    selected = pkg
+                    break
+
+            if not selected:
+                print(f"Error: Package '{args.package}' version '{args.version}' not found.")
+                print(f"\nAvailable versions:")
+                for pkg in matching_packages:
+                    print(f"  - {pkg.get('version')}")
+                sys.exit(1)
+
+            pass
+        else:
+            # Auto-select latest version using dpkg --compare-versions
+            def compare_versions(v1: str, v2: str) -> int:
+                """Compare two Debian versions. Returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal."""
+                try:
+                    result = subprocess.run(
+                        ['dpkg', '--compare-versions', v1, 'gt', v2],
+                        capture_output=True,
+                        check=False
+                    )
+                    return 1 if result.returncode == 0 else -1
+                except:
+                    # Fallback to string comparison
+                    return 1 if v1 > v2 else -1 if v1 < v2 else 0
+
+            # Find the latest version
+            selected = matching_packages[0]
+            for pkg in matching_packages[1:]:
+                if compare_versions(pkg.get('version', '0'), selected.get('version', '0')) > 0:
+                    selected = pkg
+
+        print(f"{Colors.GREEN}→{Colors.RESET} {selected.get('name')} {Colors.BOLD}{selected.get('version')}{Colors.RESET}")
     else:
         # Interactive: show menu
         choices = []
@@ -379,30 +435,31 @@ Examples:
 
     try:
         if output_path.exists() and not args.overwrite:
-            print(f"\nFile already exists: {output_path}")
-            print("Skipping download (use --overwrite to force download)")
+            print(f"{Colors.YELLOW}✓{Colors.RESET} Cached: {output_path.name}")
         else:
             download_package(url, filename, str(output_path))
-            print(f"\n✓ Downloaded: {output_path}")
+            print(f"\n{Colors.GREEN}✓{Colors.RESET} Downloaded: {output_path.name}")
 
         if args.install:
-            print(f"\nInstalling {output_path}...")
-            try:
-                subprocess.run(['sudo', 'dpkg', '-i', str(output_path)], check=True)
-                print("\n✓ Installation successful")
-            except subprocess.CalledProcessError:
-                print("\nError during installation. Attempting to fix dependencies...")
+            # Check if same version is already installed
+            installed_version = get_installed_version(selected.get('name'))
+            target_version = selected.get('version')
+
+            if installed_version == target_version and not args.force:
+                print(f"{Colors.GREEN}✓{Colors.RESET} Already installed")
+            else:
+                if installed_version:
+                    print(f"{Colors.YELLOW}↑{Colors.RESET} Upgrading from {installed_version}")
                 try:
-                    subprocess.run(['sudo', 'apt-get', 'install', '-f', '-y'], check=True)
-                    print("\n✓ Dependencies fixed")
+                    subprocess.run(['sudo', 'dpkg', '-i', str(output_path)], check=True, capture_output=True)
+                    print(f"{Colors.GREEN}✓{Colors.RESET} Installed")
                 except subprocess.CalledProcessError:
-                    print("\nFailed to fix dependencies. Please check manually.")
-                    sys.exit(1)
-        else:
-            print(f"\nTo install, run:")
-            print(f"  sudo dpkg -i {output_path}")
-            print(f"\nIf there are dependency issues, run:")
-            print(f"  sudo apt-get install -f")
+                    try:
+                        subprocess.run(['sudo', 'apt-get', 'install', '-f', '-y'], check=True, capture_output=True)
+                        print(f"{Colors.GREEN}✓{Colors.RESET} Installed (dependencies fixed)")
+                    except subprocess.CalledProcessError:
+                        print(f"{Colors.RED}✗{Colors.RESET} Installation failed")
+                        sys.exit(1)
 
     except Exception as e:
         print(f"\nError processing package: {e}")
