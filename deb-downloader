@@ -291,10 +291,15 @@ def process_deb_url(name: str, deb_url: str, output_dir: Path, install: bool, fo
         if output_path.exists() and not overwrite:
             cached_meta = load_cached_metadata(meta_path)
             current_meta = get_url_metadata(deb_url)
+            needs_download = metadata_changed(cached_meta, current_meta)
 
-            if metadata_changed(cached_meta, current_meta):
-                needs_download = True
-                print(f"{Colors.YELLOW}→{Colors.RESET} Remote file changed")
+        # Get version info from existing .deb if available
+        if output_path.exists():
+            pkg_name, pkg_version = get_deb_info(output_path)
+            if pkg_name:
+                name = pkg_name
+            if pkg_version:
+                print(f"{Colors.GREEN}→{Colors.RESET} {name} {Colors.BOLD}{pkg_version}{Colors.RESET}")
 
         if needs_download:
             download_deb_url(deb_url, str(output_path))
@@ -305,27 +310,24 @@ def process_deb_url(name: str, deb_url: str, output_dir: Path, install: bool, fo
                 save_cached_metadata(meta_path, current_meta)
             print(f"{Colors.GREEN}✓{Colors.RESET} Downloaded: {output_path.name}")
 
-        # Get version info from .deb
-        pkg_name, pkg_version = get_deb_info(output_path)
-        if pkg_name:
-            name = pkg_name
-
-        # Get installed version
-        installed_version = get_installed_version(name)
-
-        # Show version comparison
-        if installed_version and pkg_version:
-            if installed_version == pkg_version:
-                print(f"{Colors.GREEN}✓{Colors.RESET} {name} {Colors.BOLD}{pkg_version}{Colors.RESET} (installed)")
-            else:
-                print(f"{Colors.GREEN}→{Colors.RESET} {name} {installed_version} → {Colors.BOLD}{pkg_version}{Colors.RESET}")
-        elif pkg_version:
-            print(f"{Colors.GREEN}→{Colors.RESET} {name} {Colors.BOLD}{pkg_version}{Colors.RESET} (not installed)")
+            # Re-read version from newly downloaded .deb
+            pkg_name, pkg_version = get_deb_info(output_path)
+            if pkg_name:
+                name = pkg_name
+            if pkg_version:
+                print(f"{Colors.GREEN}→{Colors.RESET} {name} {Colors.BOLD}{pkg_version}{Colors.RESET}")
+        else:
+            print(f"{Colors.YELLOW}✓{Colors.RESET} Cached: {output_path.name}")
 
         if install:
-            if installed_version and pkg_version and installed_version == pkg_version and not force:
-                print(f"{Colors.GREEN}✓{Colors.RESET} Already at latest version")
+            installed_version = get_installed_version(name)
+            pkg_name, pkg_version = get_deb_info(output_path)
+
+            if installed_version == pkg_version and not force:
+                print(f"{Colors.GREEN}✓{Colors.RESET} Already installed")
             else:
+                if installed_version:
+                    print(f"{Colors.YELLOW}↑{Colors.RESET} Upgrading from {installed_version}")
                 try:
                     subprocess.run(['sudo', 'dpkg', '-i', str(output_path)], check=True, capture_output=True)
                     print(f"{Colors.GREEN}✓{Colors.RESET} Installed")
