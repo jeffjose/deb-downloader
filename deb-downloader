@@ -199,6 +199,193 @@ def compare_versions(v1: str, v2: str) -> int:
         return 1 if v1 > v2 else -1 if v1 < v2 else 0
 
 
+def get_url_metadata(url: str) -> dict:
+    """Get metadata from URL via HEAD request (ETag, Last-Modified, Content-Length)."""
+    user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+    try:
+        response = requests.head(url, timeout=10, allow_redirects=True,
+                                headers={'User-Agent': user_agent})
+        response.raise_for_status()
+        return {
+            'etag': response.headers.get('ETag', '').strip('"'),
+            'last_modified': response.headers.get('Last-Modified', ''),
+            'content_length': response.headers.get('Content-Length', ''),
+        }
+    except:
+        return {}
+
+
+def load_cached_metadata(meta_path: Path) -> dict:
+    """Load cached metadata from file."""
+    try:
+        if meta_path.exists():
+            import json
+            return json.loads(meta_path.read_text())
+    except:
+        pass
+    return {}
+
+
+def save_cached_metadata(meta_path: Path, metadata: dict):
+    """Save metadata to cache file."""
+    import json
+    meta_path.write_text(json.dumps(metadata))
+
+
+def metadata_changed(cached: dict, current: dict) -> bool:
+    """Check if any available metadata has changed."""
+    if not cached or not current:
+        return True  # No metadata to compare, assume changed
+
+    # Compare any non-empty fields that exist in both
+    for key in ['etag', 'last_modified', 'content_length']:
+        cached_val = cached.get(key, '')
+        current_val = current.get(key, '')
+        if cached_val and current_val and cached_val != current_val:
+            return True
+
+    # If we have matching metadata, no change
+    if any(cached.get(k) and current.get(k) and cached.get(k) == current.get(k)
+           for k in ['etag', 'last_modified', 'content_length']):
+        return False
+
+    return True  # No comparable metadata, assume changed
+
+
+def get_deb_info(deb_path: Path) -> tuple[str, str]:
+    """Extract package name and version from a .deb file."""
+    try:
+        result = subprocess.run(
+            ['dpkg-deb', '-f', str(deb_path), 'Package', 'Version'],
+            capture_output=True, text=True, check=True
+        )
+        pkg_name = ''
+        pkg_version = ''
+        for line in result.stdout.strip().split('\n'):
+            if line.startswith('Package: '):
+                pkg_name = line.split('Package: ', 1)[1].strip()
+            elif line.startswith('Version: '):
+                pkg_version = line.split('Version: ', 1)[1].strip()
+        return pkg_name, pkg_version
+    except:
+        return '', ''
+
+
+def process_deb_url(name: str, deb_url: str, output_dir: Path, install: bool, force: bool, overwrite: bool) -> bool:
+    """Process a direct .deb URL download. Returns True on success."""
+    print(f"{Colors.BLUE}{deb_url}{Colors.RESET}")
+
+    # Determine output filename from URL or content-disposition
+    filename = Path(deb_url.split('?')[0]).name
+    if not filename.endswith('.deb'):
+        filename = f"{name}.deb"
+
+    output_path = output_dir / filename
+    meta_path = output_dir / f".{filename}.meta"
+
+    try:
+        # Check if we need to download based on metadata
+        needs_download = overwrite or not output_path.exists()
+        current_meta = None
+
+        if output_path.exists() and not overwrite:
+            cached_meta = load_cached_metadata(meta_path)
+            current_meta = get_url_metadata(deb_url)
+
+            if metadata_changed(cached_meta, current_meta):
+                needs_download = True
+                print(f"{Colors.YELLOW}→{Colors.RESET} Remote file changed")
+
+        if needs_download:
+            download_deb_url(deb_url, str(output_path))
+            # Save metadata after successful download
+            if not current_meta:
+                current_meta = get_url_metadata(deb_url)
+            if current_meta:
+                save_cached_metadata(meta_path, current_meta)
+            print(f"{Colors.GREEN}✓{Colors.RESET} Downloaded: {output_path.name}")
+
+        # Get version info from .deb
+        pkg_name, pkg_version = get_deb_info(output_path)
+        if pkg_name:
+            name = pkg_name
+
+        # Get installed version
+        installed_version = get_installed_version(name)
+
+        # Show version comparison
+        if installed_version and pkg_version:
+            if installed_version == pkg_version:
+                print(f"{Colors.GREEN}✓{Colors.RESET} {name} {Colors.BOLD}{pkg_version}{Colors.RESET} (installed)")
+            else:
+                print(f"{Colors.GREEN}→{Colors.RESET} {name} {installed_version} → {Colors.BOLD}{pkg_version}{Colors.RESET}")
+        elif pkg_version:
+            print(f"{Colors.GREEN}→{Colors.RESET} {name} {Colors.BOLD}{pkg_version}{Colors.RESET} (not installed)")
+
+        if install:
+            if installed_version and pkg_version and installed_version == pkg_version and not force:
+                print(f"{Colors.GREEN}✓{Colors.RESET} Already at latest version")
+            else:
+                try:
+                    subprocess.run(['sudo', 'dpkg', '-i', str(output_path)], check=True, capture_output=True)
+                    print(f"{Colors.GREEN}✓{Colors.RESET} Installed")
+                except subprocess.CalledProcessError:
+                    try:
+                        subprocess.run(['sudo', 'apt-get', 'install', '-f', '-y'], check=True, capture_output=True)
+                        print(f"{Colors.GREEN}✓{Colors.RESET} Installed (dependencies fixed)")
+                    except subprocess.CalledProcessError:
+                        print(f"{Colors.RED}✗{Colors.RESET} Installation failed")
+                        return False
+
+        return True
+
+    except Exception as e:
+        print(f"{Colors.RED}✗{Colors.RESET} {name}: Error: {e}")
+        return False
+
+
+def download_deb_url(url: str, output_path: str):
+    """Download .deb file from direct URL with redirect following."""
+    temp_path = f"{output_path}.part"
+    user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
+    try:
+        response = requests.get(url, stream=True, timeout=60, allow_redirects=True,
+                               headers={'User-Agent': user_agent})
+        response.raise_for_status()
+
+        total_size = int(response.headers.get('content-length', 0))
+
+        with open(temp_path, 'wb') as f:
+            if total_size == 0:
+                f.write(response.content)
+            else:
+                downloaded = 0
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    percent = (downloaded / total_size) * 100
+                    bar_length = 50
+                    filled = int(bar_length * downloaded / total_size)
+                    bar = '=' * filled + '-' * (bar_length - filled)
+                    print(f'\r[{bar}] {percent:.1f}% ({format_size(downloaded)}/{format_size(total_size)})',
+                          end='', flush=True)
+                print()  # New line after completion
+
+        # Rename partial file to final filename
+        Path(temp_path).rename(output_path)
+
+    except (KeyboardInterrupt, Exception) as e:
+        # Clean up partial file
+        if Path(temp_path).exists():
+            Path(temp_path).unlink()
+
+        if isinstance(e, KeyboardInterrupt):
+            print("\n\nDownload cancelled.")
+            sys.exit(130)
+        raise e
+
+
 def process_package_config(pkg_config: dict, arch: str, output_dir: Path, install: bool, force: bool, overwrite: bool) -> bool:
     """Process a single package from config. Returns True on success."""
     name = pkg_config.get('name')
@@ -351,6 +538,9 @@ Examples:
   Using config file (auto-installs):
     %(prog)s --config packages.toml
 
+  Direct .deb URL download and install:
+    %(prog)s --deb "https://example.com/package.deb" --install
+
   Interactive mode (or auto-select if only one package):
     %(prog)s --url "deb https://example.com/debian stable main"
 
@@ -362,15 +552,23 @@ Examples:
     %(prog)s --url https://example.com/debian --dist stable --install
 
 Config file format (TOML):
+  # APT repository package (default type)
   [[packages]]
   name = "mypackage"
   url = "https://example.com/debian"
   distribution = "stable"
   component = "main"  # optional, defaults to "main"
+
+  # Direct .deb URL download
+  [[packages]]
+  name = "chrome"
+  type = "deb"
+  url = "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
         '''
     )
 
     parser.add_argument('--config', '-c', help='Path to TOML config file with package definitions')
+    parser.add_argument('--deb', help='Direct .deb URL to download and install')
 
     parser.add_argument('--url', help='Repository URL or full deb line')
     parser.add_argument('--dist', '--distribution', help='Distribution name (e.g., stable, focal)')
@@ -409,8 +607,21 @@ Config file format (TOML):
 
         success_count = 0
         for pkg_config in packages_config:
-            if process_package_config(pkg_config, arch, output_dir, install, args.force, args.overwrite):
-                success_count += 1
+            pkg_type = pkg_config.get('type', 'apt')
+
+            if pkg_type == 'deb':
+                # Direct .deb URL download
+                name = pkg_config.get('name', 'package')
+                deb_url = pkg_config.get('url')
+                if not deb_url:
+                    print(f"{Colors.RED}✗{Colors.RESET} {name}: Missing url for type=deb")
+                    continue
+                if process_deb_url(name, deb_url, output_dir, install, args.force, args.overwrite):
+                    success_count += 1
+            else:
+                # APT repository package (default)
+                if process_package_config(pkg_config, arch, output_dir, install, args.force, args.overwrite):
+                    success_count += 1
             print()  # Blank line between packages
 
         total = len(packages_config)
@@ -420,6 +631,24 @@ Config file format (TOML):
             print(f"{Colors.YELLOW}{success_count}/{total} packages processed{Colors.RESET}")
             sys.exit(1)
         return
+
+    # Handle direct .deb URL mode
+    if args.deb:
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Extract name from URL or use 'package'
+        name = Path(args.deb.split('?')[0]).stem or 'package'
+
+        success = process_deb_url(
+            name=name,
+            deb_url=args.deb,
+            output_dir=output_dir,
+            install=args.install,
+            force=args.force,
+            overwrite=args.overwrite
+        )
+        sys.exit(0 if success else 1)
 
     # Determine if we're in non-interactive mode
     non_interactive = args.url and args.package
