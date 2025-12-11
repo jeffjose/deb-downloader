@@ -316,9 +316,6 @@ def process_deb_url(name: str, deb_url: str, output_dir: Path, install: bool, fo
                 name = pkg_name
             if pkg_version:
                 print(f"{Colors.GREEN}→{Colors.RESET} {name} {Colors.BOLD}{pkg_version}{Colors.RESET}")
-        else:
-            print(f"{Colors.YELLOW}✓{Colors.RESET} Cached: {output_path.name}")
-
         if install:
             installed_version = get_installed_version(name)
             pkg_name, pkg_version = get_deb_info(output_path)
@@ -457,9 +454,7 @@ def process_package_config(pkg_config: dict, arch: str, output_dir: Path, instal
     output_path = output_dir / Path(filename).name
 
     try:
-        if output_path.exists() and not overwrite:
-            print(f"{Colors.YELLOW}✓{Colors.RESET} Cached: {output_path.name}")
-        else:
+        if not output_path.exists() or overwrite:
             download_package(url, filename, str(output_path))
             print(f"{Colors.GREEN}✓{Colors.RESET} Downloaded: {output_path.name}")
 
