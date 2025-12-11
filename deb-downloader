@@ -348,8 +348,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
-  Using config file:
-    %(prog)s --config packages.toml --install
+  Using config file (auto-installs):
+    %(prog)s --config packages.toml
 
   Interactive mode (or auto-select if only one package):
     %(prog)s --url "deb https://example.com/debian stable main"
@@ -404,9 +404,12 @@ Config file format (TOML):
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        # Install is implicit with --config
+        install = True
+
         success_count = 0
         for pkg_config in packages_config:
-            if process_package_config(pkg_config, arch, output_dir, args.install, args.force, args.overwrite):
+            if process_package_config(pkg_config, arch, output_dir, install, args.force, args.overwrite):
                 success_count += 1
             print()  # Blank line between packages
 
