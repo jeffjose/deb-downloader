@@ -10,6 +10,7 @@ import argparse
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import questionary
@@ -184,6 +185,122 @@ def format_size(size: int) -> str:
     return f"{size:.1f} TB"
 
 
+def compare_versions(v1: str, v2: str) -> int:
+    """Compare two Debian versions. Returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal."""
+    try:
+        result = subprocess.run(
+            ['dpkg', '--compare-versions', v1, 'gt', v2],
+            capture_output=True,
+            check=False
+        )
+        return 1 if result.returncode == 0 else -1
+    except:
+        # Fallback to string comparison
+        return 1 if v1 > v2 else -1 if v1 < v2 else 0
+
+
+def process_package_config(pkg_config: dict, arch: str, output_dir: Path, install: bool, force: bool, overwrite: bool) -> bool:
+    """Process a single package from config. Returns True on success."""
+    name = pkg_config.get('name')
+    url = pkg_config.get('url', '').rstrip('/')
+    distribution = pkg_config.get('distribution')
+    component = pkg_config.get('component', 'main')
+    version = pkg_config.get('version')
+
+    if not name or not url:
+        print(f"{Colors.RED}✗{Colors.RESET} Missing name or url in config")
+        return False
+
+    # Auto-discover distribution if not specified
+    if not distribution:
+        distributions = discover_distributions(url)
+        if len(distributions) == 1:
+            distribution = distributions[0]
+        else:
+            print(f"{Colors.RED}✗{Colors.RESET} {name}: Could not determine distribution")
+            return False
+
+    print(f"{Colors.BLUE}{url}/{distribution}/{component}/{arch}{Colors.RESET}")
+
+    # Fetch packages
+    try:
+        packages = fetch_packages_list(url, distribution, component, arch)
+    except Exception as e:
+        print(f"{Colors.RED}✗{Colors.RESET} {name}: Error fetching packages: {e}")
+        return False
+
+    if not packages:
+        print(f"{Colors.RED}✗{Colors.RESET} {name}: No packages found")
+        return False
+
+    # Find the specified package
+    matching_packages = [pkg for pkg in packages if pkg.get('name') == name]
+
+    if not matching_packages:
+        print(f"{Colors.RED}✗{Colors.RESET} {name}: Package not found in repository")
+        return False
+
+    # Select version
+    if version and version != 'latest':
+        selected = None
+        for pkg in matching_packages:
+            if pkg.get('version') == version:
+                selected = pkg
+                break
+        if not selected:
+            print(f"{Colors.RED}✗{Colors.RESET} {name}: Version '{version}' not found")
+            return False
+    else:
+        # Find latest version
+        selected = matching_packages[0]
+        for pkg in matching_packages[1:]:
+            if compare_versions(pkg.get('version', '0'), selected.get('version', '0')) > 0:
+                selected = pkg
+
+    print(f"{Colors.GREEN}→{Colors.RESET} {selected.get('name')} {Colors.BOLD}{selected.get('version')}{Colors.RESET}")
+
+    # Download
+    filename = selected.get('filename')
+    if not filename:
+        print(f"{Colors.RED}✗{Colors.RESET} {name}: No filename found")
+        return False
+
+    output_path = output_dir / Path(filename).name
+
+    try:
+        if output_path.exists() and not overwrite:
+            print(f"{Colors.YELLOW}✓{Colors.RESET} Cached: {output_path.name}")
+        else:
+            download_package(url, filename, str(output_path))
+            print(f"{Colors.GREEN}✓{Colors.RESET} Downloaded: {output_path.name}")
+
+        if install:
+            installed_version = get_installed_version(selected.get('name'))
+            target_version = selected.get('version')
+
+            if installed_version == target_version and not force:
+                print(f"{Colors.GREEN}✓{Colors.RESET} Already installed")
+            else:
+                if installed_version:
+                    print(f"{Colors.YELLOW}↑{Colors.RESET} Upgrading from {installed_version}")
+                try:
+                    subprocess.run(['sudo', 'dpkg', '-i', str(output_path)], check=True, capture_output=True)
+                    print(f"{Colors.GREEN}✓{Colors.RESET} Installed")
+                except subprocess.CalledProcessError:
+                    try:
+                        subprocess.run(['sudo', 'apt-get', 'install', '-f', '-y'], check=True, capture_output=True)
+                        print(f"{Colors.GREEN}✓{Colors.RESET} Installed (dependencies fixed)")
+                    except subprocess.CalledProcessError:
+                        print(f"{Colors.RED}✗{Colors.RESET} Installation failed")
+                        return False
+
+        return True
+
+    except Exception as e:
+        print(f"{Colors.RED}✗{Colors.RESET} {name}: Error: {e}")
+        return False
+
+
 def download_package(url: str, filename: str, output_path: str):
     """Download package with progress bar."""
     download_url = f"{url}/{filename}"
@@ -231,6 +348,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
+  Using config file:
+    %(prog)s --config packages.toml --install
+
   Interactive mode (or auto-select if only one package):
     %(prog)s --url "deb https://example.com/debian stable main"
 
@@ -240,8 +360,17 @@ Examples:
 
   Auto-install latest version:
     %(prog)s --url https://example.com/debian --dist stable --install
+
+Config file format (TOML):
+  [[packages]]
+  name = "mypackage"
+  url = "https://example.com/debian"
+  distribution = "stable"
+  component = "main"  # optional, defaults to "main"
         '''
     )
+
+    parser.add_argument('--config', '-c', help='Path to TOML config file with package definitions')
 
     parser.add_argument('--url', help='Repository URL or full deb line')
     parser.add_argument('--dist', '--distribution', help='Distribution name (e.g., stable, focal)')
@@ -255,6 +384,39 @@ Examples:
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing file if it exists')
 
     args = parser.parse_args()
+
+    # Handle config file mode
+    if args.config:
+        config_path = Path(args.config).expanduser()
+        if not config_path.exists():
+            print(f"{Colors.RED}Error:{Colors.RESET} Config file not found: {config_path}")
+            sys.exit(1)
+
+        with open(config_path, 'rb') as f:
+            config = tomllib.load(f)
+
+        packages_config = config.get('packages', [])
+        if not packages_config:
+            print(f"{Colors.RED}Error:{Colors.RESET} No packages defined in config")
+            sys.exit(1)
+
+        arch = args.arch if args.arch else get_architecture()
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        success_count = 0
+        for pkg_config in packages_config:
+            if process_package_config(pkg_config, arch, output_dir, args.install, args.force, args.overwrite):
+                success_count += 1
+            print()  # Blank line between packages
+
+        total = len(packages_config)
+        if success_count == total:
+            print(f"{Colors.GREEN}All {total} packages processed successfully{Colors.RESET}")
+        else:
+            print(f"{Colors.YELLOW}{success_count}/{total} packages processed{Colors.RESET}")
+            sys.exit(1)
+        return
 
     # Determine if we're in non-interactive mode
     non_interactive = args.url and args.package
@@ -372,20 +534,6 @@ Examples:
 
             pass
         else:
-            # Auto-select latest version using dpkg --compare-versions
-            def compare_versions(v1: str, v2: str) -> int:
-                """Compare two Debian versions. Returns 1 if v1 > v2, -1 if v1 < v2, 0 if equal."""
-                try:
-                    result = subprocess.run(
-                        ['dpkg', '--compare-versions', v1, 'gt', v2],
-                        capture_output=True,
-                        check=False
-                    )
-                    return 1 if result.returncode == 0 else -1
-                except:
-                    # Fallback to string comparison
-                    return 1 if v1 > v2 else -1 if v1 < v2 else 0
-
             # Find the latest version
             selected = matching_packages[0]
             for pkg in matching_packages[1:]:
